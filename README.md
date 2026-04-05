@@ -2,7 +2,7 @@
 
 > 微信小程序调试工具 —— 基于 Frida + CDP 代理，支持 GUI 与 CLI 双模式
 ---
-改项目仅支持windows,macos用户使用dp虚拟机即可
+本项目仅支持windows，macos用户使用dp虚拟机即可
 ## 截图预览
 
 ### 主界面 / Control Panel
@@ -123,10 +123,10 @@ pyinstaller WMPFDebugger.spec
 
 ---
 
-## 使用方法
+## 常见问题解决办法
 
-常见问题解决办法
-1.Frida 已显示连接，但小程序端显示未连接：
+1. Frida 已显示连接，但小程序端显示未连接
+
 若操作顺序无误，建议先彻底卸载微信并重启电脑（如有重要聊天记录请提前备份）。
 删除路径C:\Users\用户名\AppData\Roaming\Tencent\xwechat\XPlugin\Plugins\RadiumWMPF下所有以数字命名的文件夹，再次重启电脑后，安装微信 4.1.0.30 版本。安装完成后检查上述路径，确认文件夹编号为 16389。
 
