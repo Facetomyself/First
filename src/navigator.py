@@ -32,7 +32,10 @@ class MiniProgramNavigator:
             "tabBar:window.nav?window.nav.tabBarPages:[],"
             "appid:window.nav&&window.nav.config?(window.nav.config.appid||''):'',"
             "entry:window.nav&&window.nav.config?(window.nav.config.entryPagePath||''):'',"
-            "name:(function(){try{var a=window.__wxConfig||window.wx&&window.wx.__wxConfig||{};"
+            "name:(function(){try{"
+            "var f=window.nav&&window.nav.wxFrame;"
+            "var a=(f&&f.__wxConfig)||window.__wxConfig||"
+            "(window.wx&&window.wx.__wxConfig)||{};"
             "var b=a.accountInfo&&a.accountInfo.appAccount;"
             "return b&&b.nickname||a.appname||''}catch(e){return ''}})()"
             "})",

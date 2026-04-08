@@ -340,7 +340,7 @@ class DebugEngine:
                                 logger.info(f"[userscript] immediate inject (Runtime.evaluate): {script.name}")
                             engine.message_counter = seq
                         except Exception as e:
-                            logger.error(f"[userscript] immediate inject error: {e}")
+                            logger.warn(f"[userscript] immediate inject warning: {e}")
             except websockets.exceptions.ConnectionClosed:
                 pass
             except Exception as e:
@@ -349,6 +349,11 @@ class DebugEngine:
                 engine.miniapp_clients.discard(websocket)
                 if not engine.miniapp_clients:
                     engine._notify_status("miniapp", False)
+                    # 清理所有挂起的 CDP 响应，防止 future 泄漏
+                    for fid, fut in list(engine._pending_responses.items()):
+                        if not fut.done():
+                            fut.set_exception(RuntimeError("miniapp disconnected"))
+                    engine._pending_responses.clear()
                 logger.info("[miniapp] miniapp client disconnected")
 
         server = await websockets.server.serve(

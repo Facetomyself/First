@@ -6,15 +6,17 @@
 ## 截图预览
 
 ### 主界面 / Control Panel
-> 使用First的时候，不建议开启调试（调试主包和调试frida）的两个选项，这两个选项是用来输出全量日志的，开启之后用起来可能会比较卡。
 
-![QQ20260402-192426](https://s1.galgame.fun/imgb/u0/20260402_69ce51f6c6f60.png)
+![zhuyem](https://s1.galgame.fun/imgb/u0/20260408_69d655f49ca7e.png)
 
 ### 路由导航
-![微信图片_2026-04-02_192531_552](https://s1.galgame.fun/imgb/u0/20260402_69ce523e8b90d.png)
+![luyou](https://s1.galgame.fun/imgb/u0/20260408_69d6560ca1a39.png)
 
 ### 云函数分析
 ![QQ20260402-192623](https://s1.galgame.fun/imgb/u0/20260402_69ce527ca5480.png)
+
+### 调试开关(JSRPC 与调用 wx.cloud)
+![调试](https://s1.galgame.fun/imgb/u0/20260408_69d6564195009.png)
 
 ### 安全扫描
 待优化
@@ -137,6 +139,7 @@ pyinstaller WMPFDebugger.spec
 - [evi0s/WMPFDebugger](https://github.com/evi0s/WMPFDebugger)
 - [0xsdeo/HeartK](https://github.com/0xsdeo/HeartK)
 - [残笑/FindSomething](https://github.com/momosecurity/FindSomething)
+- [进击的HACK/JSRPC与调用wx.cloud](https://mp.weixin.qq.com/s/hTlekrCPiMJCvsHYx7CAxw)
 ---
 
 ## 致谢
@@ -146,7 +149,7 @@ pyinstaller WMPFDebugger.spec
 ---
 ## 交流群
 
-![微信图片_20260403222425_810_3](https://s1.galgame.fun/imgb/u0/20260403_69cfdafc8cb99.jpg)
+![微信图片_20260408212151_1256_3](https://s1.galgame.fun/imgb/u0/20260408_69d6567d777a9.jpg)
 
 ## 免责声明
 

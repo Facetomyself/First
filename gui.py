@@ -9,7 +9,6 @@ import os
 import queue
 import sys
 import threading
-from datetime import datetime
 
 from PySide6.QtCore import (
     Qt, QTimer, QPropertyAnimation, QEasingCurve, Property, QRect,
@@ -29,7 +28,6 @@ from src.engine import DebugEngine
 from src.navigator import MiniProgramNavigator
 from src.cloud_audit import CloudAuditor
 from src.userscript import load_userscripts_by_files
-from src.js_analyzer import analyze_js, merge_results, CATEGORY_INFO, save_report, load_reports, delete_report
 
 # ══════════════════════════════════════════
 #  配色
@@ -54,12 +52,12 @@ _TH = {"dark": _D, "light": _L}
 _FN = "Microsoft YaHei UI"
 _FM = "Consolas"
 _MENU = [
-    ("control",   "\u25c9", "控制台"),
-    ("navigator", "\u2b21", "路由导航"),
-    ("hook",      "\u25c8", "Hook"),
-    ("cloud",     "\u2601", "云扫描"),
-    ("security",  "\u2623", "敏感提取"),
-    ("logs",      "\u2261", "运行日志"),
+    ("control",   "◉", "控制台"),
+    ("navigator", "⬡", "路由导航"),
+    ("hook",      "◈", "Hook"),
+    ("cloud",     "☁", "云扫描"),
+    ("vconsole",  "◇", "调试开关"),
+    ("logs",      "≡", "运行日志"),
 ]
 
 # ══════════════════════════════════════════
@@ -72,7 +70,6 @@ _CFG_FILE = os.path.join(_BASE_DIR, "gui_config.json")
 
 os.makedirs(os.path.join(_BASE_DIR, "userscripts"), exist_ok=True)
 os.makedirs(os.path.join(_BASE_DIR, "hook_scripts"), exist_ok=True)
-os.makedirs(os.path.join(_BASE_DIR, "scan_reports"), exist_ok=True)
 
 
 def _load_cfg():
@@ -572,88 +569,6 @@ def _make_entry(placeholder="", width=None):
     return e
 
 
-# ══════════════════════════════════════════
-#  敏感提取 — 独立进程 worker
-# ══════════════════════════════════════════
-
-def _sec_analyze_one(src):
-    """独立进程 Pool 的 worker 函数：分析单个 JS 源码。"""
-    try:
-        return analyze_js(src)
-    except Exception:
-        return None
-
-
-def _sec_worker_proc(js_sources, appid, base_dir, result_q, name=""):
-    """在独立进程中并行分析 JS，通过 multiprocessing.Queue 回传进度和结果。"""
-    try:
-        total = len(js_sources)
-        total_size = sum(len(s) for s in js_sources)
-
-        if total == 0:
-            result_q.put(("done", {}, 0, 0))
-            return
-
-        import os
-        workers = min(total, max(4, os.cpu_count() or 4))
-        result_q.put(("progress", 35, f"并行分析 ({workers} 线程) ..."))
-
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        results = []
-        done_count = 0
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = {pool.submit(_sec_analyze_one, src): i for i, src in enumerate(js_sources)}
-            for fut in as_completed(futs):
-                r = fut.result()
-                if r:
-                    results.append(r)
-                done_count += 1
-                if done_count % 5 == 0 or done_count == total:
-                    pct = 30 + int(done_count / total * 60)
-                    result_q.put(("progress", pct, f"分析中 {done_count}/{total} ..."))
-
-        merged = merge_results(results) if results else {}
-        result_q.put(("progress", 95, "生成报告..."))
-
-        try:
-            save_report(base_dir, appid, merged, total, total_size, name=name)
-        except Exception:
-            pass
-
-        result_q.put(("done", merged, total, total_size))
-    except Exception as e:
-        result_q.put(("error", f"分析进程异常: {e}"))
-        result_q.put(("done", None, 0, 0))
-
-
-def _sec_run_worker(js_sources, appid, base_dir, sec_q, name=""):
-    """启动独立分析进程，用后台线程转发 multiprocessing.Queue 到 UI 的 queue.Queue。"""
-    mp_q = multiprocessing.Queue()
-    proc = multiprocessing.Process(
-        target=_sec_worker_proc,
-        args=(js_sources, appid, base_dir, mp_q, name),
-        daemon=True,
-    )
-    proc.start()
-
-    # 后台线程：等待进程完成，转发消息到 UI 队列
-    def _relay():
-        while proc.is_alive() or not mp_q.empty():
-            try:
-                item = mp_q.get(timeout=0.2)
-                sec_q.put(item)
-            except Exception:
-                pass
-        # 确保队列清空
-        while not mp_q.empty():
-            try:
-                sec_q.put(mp_q.get_nowait())
-            except Exception:
-                break
-
-    t = threading.Thread(target=_relay, daemon=True)
-    t.start()
-
 
 # ══════════════════════════════════════════
 #  主窗口
@@ -685,15 +600,13 @@ class App(QMainWindow):
         self._redirect_guard_on = False
         self._hook_injected = set()
         self._blocked_seen = 0
-        self._sec_scanning = False
-        self._sec_result = None
-        self._sec_view = "scan"  # "scan" | "report" | "history"
-
+        self._miniapp_connected = False
+        self._sb_fetch_gen = 0
+        self._vc_stable_gen = 0
         self._log_q = queue.Queue()
         self._sts_q = queue.Queue()
         self._rte_q = queue.Queue()
         self._cld_q = queue.Queue()
-        self._sec_q = queue.Queue()
 
         self._selected_preload = list(self._cfg.get("selected_preload_scripts", []))
         self._nav_route_idx = -1
@@ -731,7 +644,7 @@ class App(QMainWindow):
 
         sb_head = QFrame()
         sb_head.setObjectName("sb_head")
-        sb_head.setFixedHeight(76)
+        sb_head.setFixedHeight(90)
         sb_head_lay = QVBoxLayout(sb_head)
         sb_head_lay.addStretch()
 
@@ -784,6 +697,30 @@ class App(QMainWindow):
             self._sb_items[pid] = (row, ic, nm)
         sb_nav_lay.addStretch()
         sb_lay.addWidget(sb_nav, 1)
+
+        # 侧栏小程序信息卡片
+        sb_app_card = QFrame()
+        sb_app_card.setStyleSheet(
+            "QFrame { background: rgba(128,128,128,0.08); border-radius: 8px; }"
+            "QLabel { background: transparent; }")
+        sb_app_card_lay = QVBoxLayout(sb_app_card)
+        sb_app_card_lay.setContentsMargins(8, 6, 8, 6)
+        sb_app_card_lay.setSpacing(1)
+        self._sb_app_name = QLabel("未连接")
+        self._sb_app_name.setAlignment(Qt.AlignCenter)
+        self._sb_app_name.setFont(QFont(_FN, 8))
+        self._sb_app_name.setStyleSheet("color: #5c5c6c;")
+        self._sb_app_name.setWordWrap(True)
+        sb_app_card_lay.addWidget(self._sb_app_name)
+        self._sb_app_id = QLabel("")
+        self._sb_app_id.setAlignment(Qt.AlignCenter)
+        self._sb_app_id.setFont(QFont(_FN, 8))
+        self._sb_app_id.setStyleSheet("color: #9e9ea8;")
+        self._sb_app_id.setVisible(False)
+        self._sb_app_id.setWordWrap(True)
+        sb_app_card_lay.addWidget(self._sb_app_id)
+        sb_lay.addWidget(sb_app_card)
+        sb_lay.addSpacing(4)
 
         self._sb_theme = QLabel()
         self._sb_theme.setObjectName("sb_theme")
@@ -846,7 +783,7 @@ class App(QMainWindow):
         self._build_navigator()
         self._build_hook()
         self._build_cloud()
-        self._build_security()
+        self._build_vconsole()
         self._build_logs()
 
     # ── 控制台 ──
@@ -880,19 +817,6 @@ class App(QMainWindow):
         row1.addStretch()
         c1_lay.addLayout(row1)
 
-        c1_lay.addWidget(_make_label("调试选项", bold=True))
-        chkr = QHBoxLayout()
-        self._tog_dm = ToggleSwitch(self._cfg.get("debug_main", False))
-        self._tog_dm.toggled.connect(lambda v: self._auto_save())
-        chkr.addWidget(self._tog_dm)
-        chkr.addWidget(QLabel("调试主包"))
-        chkr.addSpacing(24)
-        self._tog_df = ToggleSwitch(self._cfg.get("debug_frida", False))
-        self._tog_df.toggled.connect(lambda v: self._auto_save())
-        chkr.addWidget(self._tog_df)
-        chkr.addWidget(QLabel("调试 Frida"))
-        chkr.addStretch()
-        c1_lay.addLayout(chkr)
         lay.addWidget(c1)
 
         # Card 2: 前加载脚本
@@ -959,10 +883,36 @@ class App(QMainWindow):
         self._app_lbl = QLabel("应用: --")
         self._app_lbl.setProperty("class", "muted")
         c3_lay.addWidget(self._app_lbl)
+        self._appname_lbl = QLabel("")
+        self._appname_lbl.setProperty("class", "muted")
+        self._appname_lbl.setVisible(False)
+        c3_lay.addWidget(self._appname_lbl)
         lay.addWidget(c3)
 
         self._stack.addWidget(page)
         self._page_map["control"] = self._stack.count() - 1
+
+        # Card 4: 常见问题解决方案
+        c4 = _make_card()
+        c4_lay = QVBoxLayout(c4)
+        c4_lay.setContentsMargins(16, 10, 16, 10)
+        c4_lay.setSpacing(8)
+        c4_lay.addWidget(_make_label("常见问题解决方案", bold=True))
+
+        faq_items = [
+            ("Frida 连接失败", "请确认当前版本是否在WMPF版本区间内,如无法解决建议安装建议版本。"),
+            ("DevTools 打开内容为空", "点击启动调试前请勿打开小程序, 启动调试打开后再次启动小程序即可。"),
+            (r"Frida 已显示连接，但小程序端显示未连接/或步骤确认没问题且无法断点", r"若操作顺序无误，建议先彻底卸载微信并重启电脑-·如有重要聊天记录请提前备份·-。删除路径C:\Users\用户名\AppData\Roaming\Tencent\xwechat\XPlugin\Plugins\RadiumWMPF下所有以数字命名的文件夹,再次重启电脑后,安装微信 4.1.0.30 版本。安装完成后检查上述路径，确认文件夹编号为 16389。"),
+        ]
+
+        for title, solution in faq_items:
+            item_lbl = QLabel(f"• {title}\n   {solution}")
+            item_lbl.setWordWrap(True)
+            item_lbl.setStyleSheet("color: #FFC107;")
+            c4_lay.addWidget(item_lbl)
+
+        c4_lay.addStretch()
+        lay.addWidget(c4)
 
     # ── 路由导航 ──
 
@@ -1010,9 +960,6 @@ class App(QMainWindow):
         self._btn_go = _make_btn("跳转", self._do_go)
         self._btn_go.setEnabled(False)
         b1.addWidget(self._btn_go)
-        self._btn_redir = _make_btn("重定向", self._do_redir)
-        self._btn_redir.setEnabled(False)
-        b1.addWidget(self._btn_redir)
         self._btn_relaunch = _make_btn("重启到页面", self._do_relaunch)
         self._btn_relaunch.setEnabled(False)
         b1.addWidget(self._btn_relaunch)
@@ -1058,6 +1005,8 @@ class App(QMainWindow):
         self._prog.setFixedHeight(6)
         lay.addWidget(self._prog)
         self._route_lbl = QLabel("当前路由: --")
+        self._route_lbl.setFixedHeight(22)
+        self._route_lbl.setProperty("class", "bold")
         lay.addWidget(self._route_lbl)
 
         self._stack.addWidget(page)
@@ -1278,145 +1227,172 @@ class App(QMainWindow):
         self._stack.addWidget(page)
         self._page_map["cloud"] = self._stack.count() - 1
 
-    # ── 敏感提取 ──
+    # ── 调试开关 (vConsole) ──
 
-    def _build_security(self):
+    def _build_vconsole(self):
         page = QWidget()
         lay = QVBoxLayout(page)
-        lay.setContentsMargins(24, 8, 24, 8)
-        lay.setSpacing(6)
+        lay.setContentsMargins(24, 12, 24, 16)
+        lay.setSpacing(10)
+        lay.setAlignment(Qt.AlignTop)
 
-        # 顶部操作栏
-        bar = QHBoxLayout()
-        self._btn_sec_scan = _make_btn("扫描当前小程序", self._sec_do_scan)
-        bar.addWidget(self._btn_sec_scan)
-        self._btn_sec_history = _make_btn("历史记录", self._sec_show_history)
-        bar.addWidget(self._btn_sec_history)
-        self._btn_sec_back = _make_btn("返回", self._sec_back_to_scan)
-        self._btn_sec_back.setVisible(False)
-        bar.addWidget(self._btn_sec_back)
-        bar.addStretch()
-        self._sec_status_lbl = QLabel("")
-        self._sec_status_lbl.setProperty("class", "muted")
-        bar.addWidget(self._sec_status_lbl)
-        lay.addLayout(bar)
+        # 风险警告卡片
+        warn_card = _make_card()
+        warn_lay = QVBoxLayout(warn_card)
+        warn_lay.setContentsMargins(16, 12, 16, 12)
+        warn_lay.setSpacing(6)
+        warn_title = QLabel("⚠  风险提示")
+        warn_title.setFont(QFont(_FN, 11, QFont.Bold))
+        warn_title.setStyleSheet("color: #e6a23c;")
+        warn_lay.addWidget(warn_title)
+        warn_text = QLabel(
+            "非正规开启小程序调试有封号风险。测试需谨慎！\n"
+            "请勿在主力账号上使用，建议使用测试号操作。")
+        warn_text.setWordWrap(True)
+        warn_text.setStyleSheet("color: #e6a23c; font-size: 12px;")
+        warn_lay.addWidget(warn_text)
+        lay.addWidget(warn_card)
 
-        # 进度条
-        self._sec_prog = QProgressBar()
-        self._sec_prog.setFixedHeight(6)
-        self._sec_prog.setRange(0, 100)
-        self._sec_prog.setValue(0)
-        self._sec_prog.setTextVisible(False)
-        self._sec_prog.setVisible(False)
-        lay.addWidget(self._sec_prog)
+        # 功能说明卡片
+        info_card = _make_card()
+        info_lay = QVBoxLayout(info_card)
+        info_lay.setContentsMargins(16, 12, 16, 12)
+        info_lay.setSpacing(6)
+        info_lay.addWidget(_make_label("功能说明", bold=True))
+        desc = QLabel(
+            "通过官方 API wx.setEnableDebug 开启小程序内置的 vConsole 调试面板。\n\n"
+            "开启后可以：\n"
+            "  •  在小程序内直接执行 JS 代码\n"
+            "  •  调用 wx.cloud.callFunction 调试云函数\n\n"
+            "关闭后重启小程序即可恢复正常。")
+        desc.setWordWrap(True)
+        desc.setProperty("class", "muted")
+        info_lay.addWidget(desc)
+        ref_lbl = QLabel(
+            '学习文档: <a href="https://mp.weixin.qq.com/s/hTlekrCPiMJCvsHYx7CAxw">'
+            '官方文档 wx.setEnableDebug</a>')
+        ref_lbl.setOpenExternalLinks(True)
+        ref_lbl.setStyleSheet("font-size: 11px;")
+        info_lay.addWidget(ref_lbl)
+        lay.addWidget(info_card)
 
-        # 主内容区 — 内含 QStackedWidget 切换 scan/report/history
-        self._sec_stack = QStackedWidget()
+        # 操作卡片
+        op_card = _make_card()
+        op_lay = QVBoxLayout(op_card)
+        op_lay.setContentsMargins(16, 12, 16, 12)
+        op_lay.setSpacing(8)
+        op_lay.addWidget(_make_label("操作", bold=True))
 
-        # --- 扫描提示页 (index 0) ---
-        scan_hint = QWidget()
-        sh_lay = QVBoxLayout(scan_hint)
-        sh_lay.setAlignment(Qt.AlignCenter)
-        hint_lbl = QLabel("连接小程序后，点击「扫描当前小程序」提取 JS 中的敏感信息")
-        hint_lbl.setProperty("class", "muted")
-        hint_lbl.setAlignment(Qt.AlignCenter)
-        hint_lbl.setWordWrap(True)
-        sh_lay.addWidget(hint_lbl)
-        self._sec_stack.addWidget(scan_hint)
+        btn_row = QHBoxLayout()
+        self._btn_vc_enable = _make_btn("▶  开启调试", self._do_vc_enable)
+        self._btn_vc_enable.setFont(QFont(_FN, 10, QFont.Bold))
+        self._btn_vc_enable.setEnabled(False)
+        btn_row.addWidget(self._btn_vc_enable)
+        self._btn_vc_disable = _make_btn("■  关闭调试", self._do_vc_disable)
+        self._btn_vc_disable.setFont(QFont(_FN, 10, QFont.Bold))
+        self._btn_vc_disable.setEnabled(False)
+        btn_row.addWidget(self._btn_vc_disable)
+        btn_row.addStretch()
+        op_lay.addLayout(btn_row)
 
-        # --- 报告页 (index 1) ---
-        report_page = QWidget()
-        rp_lay = QVBoxLayout(report_page)
-        rp_lay.setContentsMargins(0, 0, 0, 0)
-        rp_lay.setSpacing(6)
+        self._vc_status_lbl = QLabel("状态: 未连接小程序")
+        self._vc_status_lbl.setProperty("class", "muted")
+        op_lay.addWidget(self._vc_status_lbl)
+        lay.addWidget(op_card)
 
-        # 报告头部: appid + 概要
-        rp_hdr = QHBoxLayout()
-        self._sec_rpt_header = QLabel("")
-        self._sec_rpt_header.setProperty("class", "bold")
-        rp_hdr.addWidget(self._sec_rpt_header)
-        rp_hdr.addStretch()
-        self._sec_rpt_summary = QLabel("")
-        self._sec_rpt_summary.setProperty("class", "muted")
-        rp_hdr.addWidget(self._sec_rpt_summary)
-        rp_lay.addLayout(rp_hdr)
-
-        # 左右分栏
-        rp_split = QHBoxLayout()
-        rp_split.setSpacing(8)
-
-        # 左栏: 类别列表 (滚动)
-        left_scroll = QScrollArea()
-        left_scroll.setWidgetResizable(True)
-        left_scroll.setFrameShape(QFrame.NoFrame)
-        left_scroll.setFixedWidth(220)
-        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        left_inner = QWidget()
-        self._sec_cat_lay = QVBoxLayout(left_inner)
-        self._sec_cat_lay.setContentsMargins(0, 0, 0, 0)
-        self._sec_cat_lay.setSpacing(2)
-        self._sec_cat_lay.addStretch()
-        left_scroll.setWidget(left_inner)
-        rp_split.addWidget(left_scroll)
-
-        # 右栏: 详情列表 (滚动)
-        right_card = _make_card()
-        right_card_lay = QVBoxLayout(right_card)
-        right_card_lay.setContentsMargins(0, 0, 0, 0)
-        right_card_lay.setSpacing(0)
-
-        # 右栏顶部: 类别名 + 复制全部
-        self._sec_detail_bar = QHBoxLayout()
-        self._sec_detail_bar.setContentsMargins(14, 8, 14, 4)
-        self._sec_detail_title = QLabel("选择左侧类别查看详情")
-        self._sec_detail_title.setProperty("class", "bold")
-        self._sec_detail_bar.addWidget(self._sec_detail_title)
-        self._sec_detail_bar.addStretch()
-        self._btn_sec_copy_all = _make_btn("复制全部", self._sec_copy_all)
-        self._btn_sec_copy_all.setVisible(False)
-        self._sec_detail_bar.addWidget(self._btn_sec_copy_all)
-        right_card_lay.addLayout(self._sec_detail_bar)
-
-        # 右栏内容: QTextEdit (只读，自带滚动条，填满剩余空间)
-        self._sec_detail_text = QTextEdit()
-        self._sec_detail_text.setReadOnly(True)
-        self._sec_detail_text.setFont(QFont(_FM, 9))
-        self._sec_detail_text.setTextInteractionFlags(
-            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
-        self._sec_detail_text.setFrameShape(QFrame.NoFrame)
-        right_card_lay.addWidget(self._sec_detail_text, 1)
-
-        rp_split.addWidget(right_card, 1)
-        rp_lay.addLayout(rp_split, 1)
-
-        self._sec_cur_cat = None  # 当前选中类别 key
-        self._sec_cat_widgets = {}  # key -> row widget
-        self._sec_stack.addWidget(report_page)
-
-        # --- 历史页 (index 2) ---
-        history_page = QWidget()
-        hp_lay = QVBoxLayout(history_page)
-        hp_lay.setContentsMargins(0, 0, 0, 0)
-        hp_lay.setSpacing(6)
-
-        self._sec_hist_tree = QTreeWidget()
-        self._sec_hist_tree.setHeaderLabels(["时间", "AppID", "名称", "JS数量", "发现项"])
-        self._sec_hist_tree.setColumnCount(5)
-        self._sec_hist_tree.header().setStretchLastSection(True)
-        self._sec_hist_tree.setRootIsDecorated(False)
-        self._sec_hist_tree.setAlternatingRowColors(False)
-        self._sec_hist_tree.header().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self._sec_hist_tree.itemDoubleClicked.connect(self._sec_hist_open)
-        self._sec_hist_tree.setContextMenuPolicy(Qt.CustomContextMenu)
-        self._sec_hist_tree.customContextMenuRequested.connect(self._sec_hist_menu)
-        hp_lay.addWidget(self._sec_hist_tree, 1)
-
-        self._sec_stack.addWidget(history_page)
-
-        lay.addWidget(self._sec_stack, 1)
+        lay.addStretch()
 
         self._stack.addWidget(page)
-        self._page_map["security"] = self._stack.count() - 1
+        self._page_map["vconsole"] = self._stack.count() - 1
+
+    def _do_vc_enable(self):
+        if not self._engine or not self._loop or not self._loop.is_running():
+            self._log_add("error", "[调试] 请先启动调试并连接小程序")
+            return
+        from PySide6.QtWidgets import QMessageBox
+        r = QMessageBox.warning(
+            self, "风险确认",
+            "非正规开启小程序调试有封号风险。\n测试需谨慎！\n\n确定要开启吗？",
+            QMessageBox.Ok | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if r != QMessageBox.Ok:
+            return
+        self._btn_vc_enable.setEnabled(False)
+        asyncio.run_coroutine_threadsafe(self._avc_set_debug(True), self._loop)
+
+    def _do_vc_disable(self):
+        if not self._engine or not self._loop or not self._loop.is_running():
+            self._log_add("error", "[调试] 请先启动调试并连接小程序")
+            return
+        self._btn_vc_disable.setEnabled(False)
+        asyncio.run_coroutine_threadsafe(self._avc_set_debug(False), self._loop)
+
+    async def _avc_set_debug(self, enable):
+        try:
+            val = "true" if enable else "false"
+            # 先确保 navigator 已注入，通过 wxFrame.wx 调用避免超时
+            await self._navigator._ensure(force=True)
+            result = await self._engine.evaluate_js(
+                "(function(){"
+                "try{"
+                "var nav=window.nav;"
+                "if(!nav||!nav.wxFrame||!nav.wxFrame.wx)return JSON.stringify({err:'no wxFrame'});"
+                f"nav.wxFrame.wx.setEnableDebug({{enableDebug:{val},"
+                "success:function(){console.log('[First] setEnableDebug success')},"
+                "fail:function(e){console.error('[First] setEnableDebug fail',e)}"
+                "});"
+                "return JSON.stringify({ok:true})"
+                "}catch(e){return JSON.stringify({err:e.message})}"
+                "})()",
+                timeout=5.0,
+            )
+            value = None
+            if result:
+                r = result.get("result", {})
+                inner = r.get("result", {})
+                value = inner.get("value")
+            if value:
+                import json as _json
+                info = _json.loads(value)
+                if info.get("err"):
+                    raise RuntimeError(info["err"])
+            state = "已开启" if enable else "已关闭"
+            self._rte_q.put(("__vc__", enable, True))
+            self._log_q.put(("info", f"[调试] vConsole {state}"))
+        except Exception as e:
+            self._rte_q.put(("__vc__", enable, False))
+            self._log_q.put(("error", f"[调试] 操作失败: {e}"))
+
+    async def _avc_detect_debug(self):
+        """自动检测小程序是否已开启 vConsole 调试。"""
+        try:
+            await self._navigator._ensure(force=True)
+            result = await self._engine.evaluate_js(
+                "(function(){"
+                "try{"
+                "var f=window.nav&&window.nav.wxFrame?window.nav.wxFrame:window;"
+                "var c=f.__wxConfig||{};"
+                "var d=!!c.debug;"
+                "var v=!!(f.document&&f.document.getElementById('__vconsole'));"
+                "return JSON.stringify({debug:d,vconsole:v})"
+                "}catch(e){return JSON.stringify({err:e.message})}"
+                "})()",
+                timeout=5.0,
+            )
+            value = None
+            if result:
+                r = result.get("result", {})
+                inner = r.get("result", {})
+                value = inner.get("value")
+            if value:
+                info = json.loads(value)
+                if info.get("err"):
+                    return
+                is_debug = info.get("debug", False) or info.get("vconsole", False)
+                self._rte_q.put(("__vc_detect__", is_debug))
+        except Exception:
+            pass
 
     # ── 日志 ──
 
@@ -1425,6 +1401,29 @@ class App(QMainWindow):
         lay = QVBoxLayout(page)
         lay.setContentsMargins(24, 12, 24, 16)
         lay.setSpacing(10)
+
+        # 调试选项卡片
+        dc = _make_card()
+        dc_lay = QVBoxLayout(dc)
+        dc_lay.setContentsMargins(16, 10, 16, 10)
+        dc_lay.setSpacing(6)
+        dc_lay.addWidget(_make_label("调试选项", bold=True))
+        warn_lbl = QLabel("⚠ 开启后可能导致小程序卡死，请谨慎使用")
+        warn_lbl.setStyleSheet("color: #fbbf24; font-size: 9px;")
+        dc_lay.addWidget(warn_lbl)
+        chkr = QHBoxLayout()
+        self._tog_dm = ToggleSwitch(self._cfg.get("debug_main", False))
+        self._tog_dm.toggled.connect(lambda v: self._auto_save())
+        chkr.addWidget(self._tog_dm)
+        chkr.addWidget(QLabel("调试主包"))
+        chkr.addSpacing(24)
+        self._tog_df = ToggleSwitch(self._cfg.get("debug_frida", False))
+        self._tog_df.toggled.connect(lambda v: self._auto_save())
+        chkr.addWidget(self._tog_df)
+        chkr.addWidget(QLabel("调试 Frida"))
+        chkr.addStretch()
+        dc_lay.addLayout(chkr)
+        lay.addWidget(dc)
 
         hdr = QHBoxLayout()
         hdr.addWidget(_make_label("日志输出", bold=True))
@@ -1520,17 +1519,27 @@ class App(QMainWindow):
         self.setStyleSheet(build_qss(self._tn))
         self._update_theme_label()
         self._update_toggle_colors()
+        self._refresh_sb_app_card()
         self._hl_sb()
         self._auto_save()
 
     def _update_theme_label(self):
-        txt = "\u2600  浅色模式" if self._tn == "dark" else "\u263d  深色模式"
+        txt = "☀  浅色模式" if self._tn == "dark" else "☽  深色模式"
         self._sb_theme.setText(txt)
 
     def _update_toggle_colors(self):
         c = _TH[self._tn]
         for tog in (self._tog_dm, self._tog_df):
             tog.set_colors(c["accent"], c["text4"])
+
+    def _refresh_sb_app_card(self):
+        """主题切换时刷新侧栏小程序卡片颜色。"""
+        c = _TH[self._tn]
+        if self._sb_app_id.isVisible():
+            self._sb_app_name.setStyleSheet(f"color: {c['success']};")
+            self._sb_app_id.setStyleSheet(f"color: {c['success']};")
+        else:
+            self._sb_app_name.setStyleSheet(f"color: {c['text3']};")
 
     def _auto_save(self):
         data = {
@@ -1675,13 +1684,18 @@ class App(QMainWindow):
         self._guard_label.setText("防跳转: 关闭")
         self._devtools_lbl.setText("")
         self._devtools_copy_hint.setText("")
-        if self._sec_scanning:
-            self._sec_scanning = False
-            self._btn_sec_scan.setEnabled(True)
-            self._sec_prog.setVisible(False)
+        # 引擎停止，清除侧栏和运行状态卡片的小程序信息
+        c = _TH[self._tn]
+        self._sb_app_name.setText("未连接")
+        self._sb_app_name.setStyleSheet(f"color: {c['text3']};")
+        self._sb_app_id.setText("")
+        self._sb_app_id.setVisible(False)
+        self._app_lbl.setText("AppID: --")
+        self._appname_lbl.setText("")
+        self._appname_lbl.setVisible(False)
 
     def _nav_btns(self, on):
-        for b in (self._btn_go, self._btn_redir, self._btn_relaunch,
+        for b in (self._btn_go, self._btn_relaunch,
                   self._btn_back, self._btn_auto, self._btn_prev,
                   self._btn_next, self._btn_copy_route):
             b.setEnabled(on)
@@ -1697,8 +1711,85 @@ class App(QMainWindow):
             self._rte_q.put(("routes", self._navigator.pages, self._navigator.tab_bar_pages))
             self._rte_q.put(("app_info", self._navigator.app_info))
             QTimer.singleShot(0, self._poll_route_start)
+            # fetch_config 的 name 可能为空，补充通过 wxFrame 路径获取完整信息
+            await self._afetch_app_info()
         except Exception as e:
             self._log_q.put(("error", f"[导航] 获取失败: {e}"))
+
+    async def _afetch_app_info(self):
+        """通过 nav_inject 的 wxFrame.__wxConfig 获取小程序名称和appid，用于侧栏显示。"""
+        try:
+            # 强制重新注入 navigator（重连后 WebView 上下文是全新的）
+            await self._navigator._ensure(force=True)
+            result = await self._engine.evaluate_js(
+                "(function(){"
+                "try{"
+                "var nav=window.nav;"
+                "if(!nav||!nav.wxFrame)return JSON.stringify({err:'no nav'});"
+                "var c=nav.wxFrame.__wxConfig||{};"
+                "var ai=c.accountInfo||{};"
+                "var aa=ai.appAccount||{};"
+                "return JSON.stringify({"
+                "appid:aa.appId||ai.appId||c.appid||'',"
+                "name:aa.nickname||ai.nickname||c.appname||''"
+                "})"
+                "}catch(e){return JSON.stringify({err:e.message})}"
+                "})()",
+                timeout=5.0,
+            )
+            value = None
+            if result:
+                r = result.get("result", {})
+                inner = r.get("result", {})
+                value = inner.get("value")
+            if value:
+                info = json.loads(value)
+                if info.get("err"):
+                    return
+                self._rte_q.put(("app_info", info))
+        except Exception:
+            pass
+
+    def _delayed_stable_connect(self, gen):
+        """连接稳定后再启用按钮和触发后续操作，gen 不匹配说明中间又断过，跳过。"""
+        if gen != self._vc_stable_gen:
+            return
+        if not self._miniapp_connected:
+            return
+        self._nav_btns(True)
+        self._btn_vc_enable.setEnabled(True)
+        self._btn_vc_disable.setEnabled(True)
+        self._vc_status_lbl.setText("状态: 就绪")
+        # 自动检测 vConsole 调试状态
+        if self._engine and self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._avc_detect_debug(), self._loop)
+        # 延迟获取侧栏信息
+        self._sb_fetch_gen += 1
+        fetch_gen = self._sb_fetch_gen
+        QTimer.singleShot(1500, lambda: self._delayed_fetch_app_info(fetch_gen))
+        # 自动恢复云扫描
+        if not self._cloud_scan_active and self._auditor:
+            self._cloud_start_scan()
+
+    def _delayed_fetch_app_info(self, gen):
+        """延迟调用，只有最后一次触发的 gen 匹配才执行。"""
+        if gen != self._sb_fetch_gen:
+            return
+        if self._miniapp_connected and self._engine and self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._afetch_app_info(), self._loop)
+
+    def _delayed_clear_app_info(self, gen):
+        """延迟清除侧栏信息，gen 不匹配说明已重连，跳过。"""
+        if gen != self._sb_fetch_gen:
+            return
+        c = _TH[self._tn]
+        self._sb_app_name.setText("未连接")
+        self._sb_app_name.setStyleSheet(f"color: {c['text3']};")
+        self._sb_app_id.setText("")
+        self._sb_app_id.setVisible(False)
+        self._app_lbl.setText("AppID: --")
+        self._appname_lbl.setText("")
+        self._appname_lbl.setVisible(False)
 
     def _poll_route_start(self):
         if not self._running:
@@ -1734,12 +1825,6 @@ class App(QMainWindow):
         if r and self._engine and self._loop:
             asyncio.run_coroutine_threadsafe(
                 self._anav("navigate_to", r, "跳转"), self._loop)
-
-    def _do_redir(self):
-        r = self._sel_route()
-        if r and self._engine and self._loop:
-            asyncio.run_coroutine_threadsafe(
-                self._anav("redirect_to", r, "重定向"), self._loop)
 
     def _do_relaunch(self):
         r = self._sel_route()
@@ -1856,8 +1941,6 @@ class App(QMainWindow):
         menu.addSeparator()
         menu.addAction("跳转", lambda: asyncio.run_coroutine_threadsafe(
             self._anav("navigate_to", route, "跳转"), self._loop) if self._engine and self._loop else None)
-        menu.addAction("重定向", lambda: asyncio.run_coroutine_threadsafe(
-            self._anav("redirect_to", route, "重定向"), self._loop) if self._engine and self._loop else None)
         menu.addAction("重启到页面", lambda: asyncio.run_coroutine_threadsafe(
             self._anav("relaunch_to", route, "重启"), self._loop) if self._engine and self._loop else None)
         menu.exec(self._tree.viewport().mapToGlobal(pos))
@@ -1905,13 +1988,16 @@ class App(QMainWindow):
                 self._fill_tree(self._all_routes, self._navigator.tab_bar_pages)
             return
         flt = [p for p in self._all_routes if q in p.lower()]
+        self._tree.setUpdatesEnabled(False)
         self._tree.clear()
         for p in flt:
             item = QTreeWidgetItem([p])
             item.setData(0, Qt.UserRole, p)
             self._tree.addTopLevelItem(item)
+        self._tree.setUpdatesEnabled(True)
 
     def _fill_tree(self, pages, tab_bar):
+        self._tree.setUpdatesEnabled(False)
         self._tree.clear()
         tabs = set(tab_bar)
         groups = {}
@@ -1939,6 +2025,7 @@ class App(QMainWindow):
                 child = QTreeWidgetItem([d])
                 child.setData(0, Qt.UserRole, p)
                 nd.addChild(child)
+        self._tree.setUpdatesEnabled(True)
 
     def _select_tree_route(self, route):
         """Select the tree item matching the given route path."""
@@ -2153,399 +2240,6 @@ class App(QMainWindow):
             self._log_add("error", f"[云扫描] 导出失败: {e}")
 
     # ──────────────────────────────────
-    #  敏感提取业务
-    # ──────────────────────────────────
-
-    def _sec_do_scan(self):
-        if self._sec_scanning:
-            self._log_add("info", "[敏感提取] 扫描正在进行中，请稍候...")
-            return
-        if not self._engine or not self._loop or not self._loop.is_running():
-            self._log_add("error", "[敏感提取] 请先启动调试并连接小程序")
-            return
-        if not self._engine.miniapp_clients:
-            self._log_add("error", "[敏感提取] 小程序未连接，请先打开小程序")
-            return
-        self._sec_scanning = True
-        self._btn_sec_scan.setEnabled(False)
-        self._sec_prog.setVisible(True)
-        self._sec_prog.setValue(0)
-        self._sec_status_lbl.setText("正在提取 JS 源码...")
-        self._sec_stack.setCurrentIndex(0)
-        self._log_add("info", "[敏感提取] 开始扫描...")
-        fut = asyncio.run_coroutine_threadsafe(self._asec_scan(), self._loop)
-        # 捕获 future 异常，防止静默失败
-        def _on_scan_done(f):
-            try:
-                f.result()
-            except Exception as e:
-                self._sec_q.put(("error", f"扫描协程异常: {e}"))
-                self._sec_q.put(("done", None, 0, 0))
-        fut.add_done_callback(_on_scan_done)
-
-    async def _asec_scan(self):
-        try:
-            # Step 1: 通过 CDP Debugger 获取所有 JS 脚本源码
-            self._sec_q.put(("progress", 5, "正在收集脚本列表..."))
-
-            script_ids = []
-
-            def _on_parsed(data):
-                p = data.get("params", {})
-                sid = p.get("scriptId")
-                if sid:
-                    script_ids.append((sid, p.get("url", "")))
-
-            self._engine.on_cdp_event("Debugger.scriptParsed", _on_parsed)
-            try:
-                try:
-                    await self._engine.send_cdp_command("Debugger.disable", timeout=3.0)
-                except Exception:
-                    pass
-                await asyncio.sleep(0.3)
-                try:
-                    await self._engine.send_cdp_command("Debugger.enable", timeout=5.0)
-                except asyncio.TimeoutError:
-                    self._sec_q.put(("log", "Debugger.enable 超时，尝试重新启用..."))
-                    await asyncio.sleep(0.5)
-                    try:
-                        await self._engine.send_cdp_command("Debugger.enable", timeout=5.0)
-                    except Exception as e2:
-                        self._sec_q.put(("log", f"Debugger.enable 重试失败: {e2}"))
-                try:
-                    await self._engine.send_cdp_command(
-                        "Debugger.setSkipAllPauses", {"skip": True}, timeout=3.0)
-                except Exception:
-                    pass
-                # 等待 scriptParsed 事件全部到达：
-                # 先等 2 秒让大部分事件到达，然后连续 3 次(每次 0.4s)数量不变才认为稳定
-                await asyncio.sleep(2.0)
-                stable_count = 0
-                prev = 0
-                for _ in range(15):
-                    cur = len(script_ids)
-                    if cur == prev and cur > 0:
-                        stable_count += 1
-                        if stable_count >= 3:
-                            break
-                    else:
-                        stable_count = 0
-                    prev = cur
-                    await asyncio.sleep(0.4)
-                self._sec_q.put(("log", f"脚本收集完成: {len(script_ids)} 个"))
-            except Exception as e:
-                self._sec_q.put(("log", f"Debugger 启动异常: {e}"))
-            finally:
-                self._engine.off_cdp_event("Debugger.scriptParsed", _on_parsed)
-
-            if not script_ids:
-                self._sec_q.put(("error", "未能获取到脚本列表，请确保小程序已打开"))
-                self._sec_q.put(("done", None, 0, 0))
-                return
-
-            self._sec_q.put(("progress", 15,
-                             f"发现 {len(script_ids)} 个脚本，正在提取源码..."))
-
-            # Step 2: 逐个获取脚本源码
-            js_sources = []
-            for i, (sid, url) in enumerate(script_ids):
-                try:
-                    resp = await self._engine.send_cdp_command(
-                        "Debugger.getScriptSource", {"scriptId": sid}, timeout=8.0)
-                    source = resp.get("result", {}).get("scriptSource", "")
-                    if source and len(source) > 20:
-                        js_sources.append(source)
-                except Exception:
-                    pass
-                if i % 10 == 0:
-                    pct = 15 + int((i + 1) / len(script_ids) * 15)
-                    self._sec_q.put(("progress", pct,
-                                     f"提取源码 {i+1}/{len(script_ids)} ..."))
-
-            try:
-                await self._engine.send_cdp_command("Debugger.disable", timeout=3.0)
-            except Exception:
-                pass
-
-            if not js_sources:
-                self._sec_q.put(("error", "脚本源码提取为空"))
-                self._sec_q.put(("done", None, 0, 0))
-                return
-
-            total_size = sum(len(s) for s in js_sources)
-            self._sec_q.put(("progress", 30,
-                             f"已提取 {len(js_sources)} 个 JS 源码，启动独立分析进程..."))
-
-            # Step 3: 获取小程序信息 (若还没获取过，自动 fetch_config)
-            appid = ""
-            app_name = ""
-            if self._navigator:
-                if not self._navigator.app_info or not self._navigator.app_info.get("appid"):
-                    try:
-                        await self._navigator.fetch_config()
-                    except Exception:
-                        pass
-                appid = self._navigator.app_info.get("appid", "")
-                app_name = self._navigator.app_info.get("name", "")
-            if not appid:
-                appid = "unknown"
-
-            # Step 4: 在独立进程中分析 (不阻塞主进程/UI)
-            _sec_run_worker(js_sources, appid, _BASE_DIR, self._sec_q, name=app_name)
-
-        except Exception as e:
-            self._sec_q.put(("error", f"分析失败: {e}"))
-            self._sec_q.put(("done", None, 0, 0))
-
-    def _sec_extract_val(self, result):
-        if not result:
-            return None
-        r = result.get("result", {})
-        inner = r.get("result", {})
-        return inner.get("value")
-
-    def _sec_show_report(self, result, js_count=0, total_size=0, appid="", scan_time="", name=""):
-        """在报告页渲染分析结果 (左类别列表 + 右详情)"""
-        self._sec_result = result
-        c = _TH[self._tn]
-
-        if not scan_time:
-            scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        header_parts = []
-        if name:
-            header_parts.append(name)
-        if appid:
-            header_parts.append(f"AppID: {appid}")
-        self._sec_rpt_header.setText("  |  ".join(header_parts) if header_parts else "分析报告")
-
-        total_findings = sum(len(v) for v in result.values() if isinstance(v, list))
-        summary = f"{js_count} 个 JS ({self._fmt_size(total_size)})  |  " \
-                  f"{total_findings} 项  |  {scan_time}" if js_count else \
-                  f"{total_findings} 项  |  {scan_time}"
-        self._sec_rpt_summary.setText(summary)
-
-        # 清除旧的左栏类别行
-        while self._sec_cat_lay.count() > 1:
-            item = self._sec_cat_lay.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
-        self._sec_cat_widgets.clear()
-        self._sec_cur_cat = None
-
-        # 生成左栏类别行
-        for key in CATEGORY_INFO:
-            items = result.get(key, [])
-            cn, _ = CATEGORY_INFO[key]
-            count = len(items)
-
-            row = QFrame()
-            row.setFixedHeight(38)
-            row.setCursor(Qt.PointingHandCursor)
-            row_lay = QHBoxLayout(row)
-            row_lay.setContentsMargins(0, 0, 6, 0)
-            row_lay.setSpacing(6)
-
-            # 绿色竖条
-            bar = QFrame()
-            bar.setFixedSize(4, 24)
-            bar.setStyleSheet(f"background: {c['accent']}; border-radius: 2px;")
-            row_lay.addWidget(bar)
-
-            name_lbl = QLabel(cn)
-            name_lbl.setProperty("class", "bold")
-            name_lbl.setFont(QFont(_FN, 10))
-            row_lay.addWidget(name_lbl, 1)
-
-            count_lbl = QLabel(str(count))
-            count_lbl.setFont(QFont(_FM, 9))
-            if count > 0:
-                count_lbl.setStyleSheet(f"color: {c['accent']};")
-            else:
-                count_lbl.setStyleSheet(f"color: {c['text3']};")
-            row_lay.addWidget(count_lbl)
-
-            copy_btn = QPushButton("复制")
-            copy_btn.setFixedSize(52, 26)
-            copy_btn.setFont(QFont(_FN, 9))
-            copy_btn.clicked.connect(lambda _, k=key, b=copy_btn: self._sec_copy_cat(k, b))
-            row_lay.addWidget(copy_btn)
-
-            row.mousePressEvent = lambda e, k=key: self._sec_select_cat(k)
-            self._sec_cat_widgets[key] = row
-            self._sec_cat_lay.insertWidget(self._sec_cat_lay.count() - 1, row)
-
-        # 清空右侧
-        self._sec_clear_detail()
-        self._sec_detail_title.setText("选择左侧类别查看详情")
-        self._btn_sec_copy_all.setVisible(False)
-
-        # 自动选中第一个有内容的类别
-        for key in CATEGORY_INFO:
-            if result.get(key):
-                self._sec_select_cat(key)
-                break
-
-        self._sec_stack.setCurrentIndex(1)
-        self._btn_sec_back.setVisible(True)
-
-    def _sec_select_cat(self, key):
-        """选中左栏类别，在右栏显示详情列表"""
-        c = _TH[self._tn]
-        self._sec_cur_cat = key
-
-        # 高亮左栏选中项
-        for k, row in self._sec_cat_widgets.items():
-            if k == key:
-                row.setStyleSheet(
-                    f"QFrame {{ background: {c['sb_active']}; border-radius: 6px; }}"
-                    f" QLabel {{ color: {c['text1']}; }}"
-                    f" QPushButton {{ color: {c['text1']}; }}"
-                )
-            else:
-                row.setStyleSheet("")
-
-        items = self._sec_result.get(key, []) if self._sec_result else []
-        cn, _ = CATEGORY_INFO.get(key, (key, ""))
-
-        self._sec_detail_title.setText(f"{cn}  ({len(items)})")
-        self._btn_sec_copy_all.setVisible(len(items) > 0)
-
-        # 直接填充 QTextEdit，每行一条
-        if items:
-            self._sec_detail_text.setStyleSheet(
-                f"QTextEdit {{ color: {c['text1']}; background: transparent;"
-                f" selection-background-color: {c['accent']}; }}"
-            )
-            self._sec_detail_text.setPlainText("\n".join(str(v) for v in items))
-        else:
-            self._sec_detail_text.clear()
-
-    def _sec_clear_detail(self):
-        """清空右栏详情"""
-        self._sec_detail_text.clear()
-
-    def _sec_copy_cat(self, key, btn=None):
-        """复制某个类别的全部内容"""
-        items = self._sec_result.get(key, []) if self._sec_result else []
-        if items:
-            QApplication.clipboard().setText("\n".join(str(v) for v in items))
-            cn, _ = CATEGORY_INFO.get(key, (key, ""))
-            self._sec_status_lbl.setText(f"已复制 {cn} ({len(items)} 项)")
-            if btn and isinstance(btn, QPushButton):
-                old_text = btn.text()
-                btn.setText("已复制")
-                QTimer.singleShot(1200, lambda: btn.setText(old_text) if btn else None)
-
-    def _sec_copy_all(self):
-        """复制当前选中类别的全部内容"""
-        if self._sec_cur_cat:
-            self._sec_copy_cat(self._sec_cur_cat, self._btn_sec_copy_all)
-
-    def _sec_show_history(self):
-        self._sec_hist_tree.clear()
-        reports = load_reports(_BASE_DIR)
-        for r in reports:
-            summary = r.get("summary", {})
-            total = sum(summary.values())
-            item = QTreeWidgetItem([
-                r.get("time", ""),
-                r.get("appid", ""),
-                r.get("name", ""),
-                str(r.get("js_count", 0)),
-                str(total),
-            ])
-            item.setData(0, Qt.UserRole, r)
-            self._sec_hist_tree.addTopLevelItem(item)
-        self._sec_stack.setCurrentIndex(2)
-        self._btn_sec_back.setVisible(True)
-        self._sec_status_lbl.setText(f"共 {len(reports)} 条记录")
-
-    def _sec_hist_open(self, item):
-        r = item.data(0, Qt.UserRole)
-        if not r:
-            return
-        result = r.get("result", {})
-        self._sec_show_report(
-            result,
-            js_count=r.get("js_count", 0),
-            total_size=r.get("total_size", 0),
-            appid=r.get("appid", ""),
-            scan_time=r.get("time", ""),
-            name=r.get("name", ""),
-        )
-
-    def _sec_hist_menu(self, pos):
-        item = self._sec_hist_tree.itemAt(pos)
-        if not item:
-            return
-        r = item.data(0, Qt.UserRole)
-        menu = QMenu(self)
-        menu.addAction("查看报告", lambda: self._sec_hist_open(item))
-        if r:
-            menu.addAction("删除", lambda: self._sec_hist_delete(item, r))
-        menu.exec(self._sec_hist_tree.viewport().mapToGlobal(pos))
-
-    def _sec_hist_delete(self, item, r):
-        fn = r.get("_filename", "")
-        if fn:
-            delete_report(_BASE_DIR, fn)
-        idx = self._sec_hist_tree.indexOfTopLevelItem(item)
-        if idx >= 0:
-            self._sec_hist_tree.takeTopLevelItem(idx)
-
-    def _sec_back_to_scan(self):
-        if self._sec_result:
-            self._sec_stack.setCurrentIndex(1)
-        else:
-            self._sec_stack.setCurrentIndex(0)
-        self._btn_sec_back.setVisible(False)
-        self._sec_status_lbl.setText("")
-
-    def _handle_sec(self, item):
-        kind = item[0]
-        if kind == "progress":
-            _, pct, msg = item
-            self._sec_prog.setValue(pct)
-            self._sec_status_lbl.setText(msg)
-        elif kind == "log":
-            self._log_add("info", f"[敏感提取] {item[1]}")
-        elif kind == "error":
-            self._log_add("error", f"[敏感提取] {item[1]}")
-            self._sec_status_lbl.setText(item[1])
-        elif kind == "done":
-            _, result, js_count, total_size = item
-            self._sec_scanning = False
-            self._btn_sec_scan.setEnabled(True)
-            self._sec_prog.setValue(100)
-            QTimer.singleShot(500, lambda: self._sec_prog.setVisible(False))
-            if result:
-                total_findings = sum(len(v) for v in result.values() if isinstance(v, list))
-                self._sec_status_lbl.setText(f"分析完成，发现 {total_findings} 项")
-                self._log_add("info", f"[敏感提取] 完成: {js_count} 个 JS, 发现 {total_findings} 项")
-                appid = ""
-                app_name = ""
-                if self._navigator and self._navigator.app_info:
-                    appid = self._navigator.app_info.get("appid", "")
-                    app_name = self._navigator.app_info.get("name", "")
-                self._sec_show_report(result, js_count, total_size, appid, name=app_name)
-            else:
-                self._sec_status_lbl.setText("分析完成，无结果")
-
-    @staticmethod
-    def _fmt_size(n):
-        if n < 1024:
-            return f"{n} B"
-        elif n < 1024 * 1024:
-            return f"{n/1024:.1f} KB"
-        else:
-            return f"{n/1024/1024:.1f} MB"
-
-    @staticmethod
-    def _html_esc(s):
-        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-    # ──────────────────────────────────
     #  轮询
     # ──────────────────────────────────
 
@@ -2561,12 +2255,14 @@ class App(QMainWindow):
             else:
                 lv, tx = msg
                 self._log_add(lv, tx)
+        last_sts = None
         for _ in range(50):
             try:
-                s = self._sts_q.get_nowait()
+                last_sts = self._sts_q.get_nowait()
             except queue.Empty:
                 break
-            self._apply_sts(s)
+        if last_sts is not None:
+            self._apply_sts(last_sts)
         for _ in range(50):
             try:
                 item = self._rte_q.get_nowait()
@@ -2579,23 +2275,33 @@ class App(QMainWindow):
             except queue.Empty:
                 break
             self._handle_cld(item)
-        for _ in range(50):
-            try:
-                item = self._sec_q.get_nowait()
-            except queue.Empty:
-                break
-            self._handle_sec(item)
 
     def _apply_sts(self, sts):
         c = _TH[self._tn]
+        is_connected = sts.get("miniapp", False)
         for key, (dot, lb, name) in self._dots.items():
             on = sts.get(key, False)
             dot.set_color(c["success"] if on else c["text4"])
             lb.setText(f"{name}: {'已连接' if on else '未连接'}")
             lb.setStyleSheet(f"color: {c['success'] if on else c['text2']};")
-        self._nav_btns(sts.get("miniapp", False))
-        if sts.get("miniapp") and not self._cloud_scan_active and self._auditor:
-            self._cloud_start_scan()
+        # 断开时立即禁用（除了已有路由时保留导航按钮）
+        if not is_connected:
+            if not self._all_routes:
+                self._nav_btns(False)
+            self._btn_vc_enable.setEnabled(False)
+            self._btn_vc_disable.setEnabled(False)
+            self._vc_status_lbl.setText("状态: 未连接小程序")
+            # 已有路由数据时不清除侧栏信息（短暂断连不影响）
+            if not self._all_routes:
+                self._sb_fetch_gen += 1
+                gen = self._sb_fetch_gen
+                QTimer.singleShot(5000, lambda: self._delayed_clear_app_info(gen))
+        # 连接时延迟启用，等连接稳定（防止重启时反复抖动）
+        self._vc_stable_gen += 1
+        gen_stable = self._vc_stable_gen
+        if is_connected:
+            QTimer.singleShot(1500, lambda: self._delayed_stable_connect(gen_stable))
+        self._miniapp_connected = is_connected
 
     def _handle_rte(self, item):
         kind = item[0]
@@ -2606,11 +2312,31 @@ class App(QMainWindow):
         elif kind == "app_info":
             info = item[1]
             aid = info.get("appid", "")
+            aname = info.get("name", "")
             ent = info.get("entry", "")
-            txt = f"应用: {aid}" if aid else "应用: --"
+            # 运行状态卡片 — appid
+            txt = f"AppID: {aid}" if aid else "AppID: --"
             if ent:
                 txt += f"  |  入口: {ent}"
             self._app_lbl.setText(txt)
+            # 运行状态卡片 — 名称
+            if aname:
+                self._appname_lbl.setText(f"当前链接小程序: {aname}")
+                self._appname_lbl.setVisible(True)
+            else:
+                self._appname_lbl.setVisible(False)
+            # 更新侧栏小程序信息卡片
+            c = _TH[self._tn]
+            if aname or aid:
+                self._sb_app_name.setText(f"名称: {aname}" if aname else "名称: --")
+                self._sb_app_name.setStyleSheet(f"color: {c['success']};")
+                self._sb_app_id.setText(f"AppID: {aid}" if aid else "AppID: --")
+                self._sb_app_id.setStyleSheet(f"color: {c['success']};")
+                self._sb_app_id.setVisible(True)
+            else:
+                self._sb_app_name.setText("未连接")
+                self._sb_app_name.setStyleSheet(f"color: {c['text3']};")
+                self._sb_app_id.setVisible(False)
         elif kind == "current":
             r = item[1]
             self._route_lbl.setText(f"当前路由: /{r}" if r else "当前路由: --")
@@ -2633,6 +2359,30 @@ class App(QMainWindow):
             self._btn_auto.setEnabled(True)
             self._btn_autostop.setEnabled(False)
             self._log_add("info", "[导航] 遍历完成")
+        elif kind == "__vc__":
+            _, enable, ok = item
+            c = _TH[self._tn]
+            if ok:
+                if enable:
+                    self._vc_status_lbl.setText("状态: 已开启 (重启小程序后生效)")
+                    self._vc_status_lbl.setStyleSheet(f"color: {c['success']};")
+                else:
+                    self._vc_status_lbl.setText("状态: 已关闭 (重启小程序后生效)")
+                    self._vc_status_lbl.setStyleSheet(f"color: {c['text3']};")
+            else:
+                self._vc_status_lbl.setText("状态: 操作失败")
+                self._vc_status_lbl.setStyleSheet(f"color: {c['error']};")
+            self._btn_vc_enable.setEnabled(True)
+            self._btn_vc_disable.setEnabled(True)
+        elif kind == "__vc_detect__":
+            is_debug = item[1]
+            c = _TH[self._tn]
+            if is_debug:
+                self._vc_status_lbl.setText("状态: 已开启")
+                self._vc_status_lbl.setStyleSheet(f"color: {c['success']};")
+            else:
+                self._vc_status_lbl.setText("状态: 未开启")
+                self._vc_status_lbl.setStyleSheet(f"color: {c['text3']};")
 
     def _handle_cld(self, item):
         kind = item[0]
@@ -2729,8 +2479,19 @@ if __name__ == "__main__":
     import signal
     signal.signal(signal.SIGINT, signal.SIG_DFL)   # Ctrl+C 直接退出
 
+    # Windows 任务栏图标: 设置 AppUserModelID 使其显示自定义图标而非 Python 默认图标
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("spade.first.gui")
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
     app.setFont(QFont(_FN, 9))
+    _ico = os.path.join(_BASE_DIR, "icon.ico")
+    if os.path.exists(_ico):
+        app.setWindowIcon(QIcon(_ico))
     window = App()
     window.show()
     sys.exit(app.exec())
