@@ -831,9 +831,15 @@ class App(QMainWindow):
         self._btn_preload_refresh = _make_btn("刷新", self._preload_refresh)
         hdr_row.addWidget(self._btn_preload_refresh)
         c2_lay.addLayout(hdr_row)
-        self._preload_container = QVBoxLayout()
+        preload_scroll = QScrollArea()
+        preload_scroll.setWidgetResizable(True)
+        preload_scroll.setMaximumHeight(160)
+        preload_inner = QWidget()
+        self._preload_container = QVBoxLayout(preload_inner)
         self._preload_container.setSpacing(2)
-        c2_lay.addLayout(self._preload_container)
+        self._preload_container.setContentsMargins(0, 0, 0, 0)
+        preload_scroll.setWidget(preload_inner)
+        c2_lay.addWidget(preload_scroll)
         lay.addWidget(c2)
         self._preload_refresh()
 
@@ -1270,7 +1276,7 @@ class App(QMainWindow):
         info_lay.addWidget(desc)
         ref_lbl = QLabel(
             '学习文档: <a href="https://mp.weixin.qq.com/s/hTlekrCPiMJCvsHYx7CAxw">'
-            '官方文档 wx.setEnableDebug</a>')
+            '微信公众号文档</a>')
         ref_lbl.setOpenExternalLinks(True)
         ref_lbl.setStyleSheet("font-size: 11px;")
         info_lay.addWidget(ref_lbl)
